@@ -1,0 +1,26 @@
+{
+  "name": "mem-snap-analyzer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^1.5.0",
+    "vue": "^3.4.0",
+    "vue-router": "^4.2.5",
+    "pinia": "^2.1.7",
+    "element-plus": "^2.4.4",
+    "@element-plus/icons-vue": "^2.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.5.0",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "vite": "^5.0.8",
+    "sass": "^1.69.5"
+  }
+}

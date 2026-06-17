@@ -32,3 +32,11 @@ __pycache__/
 # Env
 .env
 .env.local
+
+# Tauri
+src-tauri/target/
+src-tauri/Cargo.lock
+src-tauri/snapshots.db
+src-tauri/snapshots.db-*
+src-tauri/data/
+

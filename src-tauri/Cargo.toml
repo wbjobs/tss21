@@ -1,0 +1,49 @@
+[package]
+name = "mem-snap-analyzer"
+version = "0.1.0"
+description = "Process Memory Snapshot Analyzer"
+authors = ["you"]
+edition = "2021"
+rust-version = "1.70"
+
+[lib]
+name = "mem_snap_analyzer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+winapi = { version = "0.3", features = [
+  "winbase",
+  "winnt",
+  "tlhelp32",
+  "processthreadsapi",
+  "memoryapi",
+  "handleapi",
+  "errhandlingapi",
+  "psapi",
+  "impl-default",
+  "minwindef",
+  "fileapi",
+  "libloaderapi",
+  "stringapiset",
+] }
+parking_lot = "0.12"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
