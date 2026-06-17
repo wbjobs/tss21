@@ -97,6 +97,15 @@ export const useProcessStore = defineStore('process', {
       } finally {
         this.loading = false
       }
+    },
+
+    async checkPrivilege(pid) {
+      try {
+        return await invoke('check_privilege', { pid })
+      } catch (e) {
+        console.error('Failed to check privilege:', e)
+        return null
+      }
     }
   }
 })

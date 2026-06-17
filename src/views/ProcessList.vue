@@ -1,5 +1,14 @@
 <template>
   <div class="process-list-container">
+    <el-alert
+      v-if="privilegeInfo && !privilegeInfo.is_admin"
+      type="warning"
+      show-icon
+      :title="'权限提示：当前未以管理员身份运行'"
+      :description="privilegeInfo.suggested_action"
+      style="margin-bottom: 16px;"
+    />
+
     <div class="toolbar">
       <div class="filter-section">
         <el-input
@@ -75,7 +84,27 @@
         </template>
       </el-table-column>
       <el-table-column prop="thread_count" label="线程数" width="100" sortable />
-      <el-table-column prop="path" label="可执行文件路径" min-width="300" show-overflow-tooltip />
+      <el-table-column label="权限状态" width="120">
+        <template #default="{ row }">
+          <el-tag
+            v-if="isProtectedProcess(row.name)"
+            type="danger"
+            size="small"
+            effect="dark"
+          >
+            受保护
+          </el-tag>
+          <el-tag
+            v-else
+            type="success"
+            size="small"
+            effect="light"
+          >
+            可访问
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="path" label="可执行文件路径" min-width="260" show-overflow-tooltip />
     </el-table>
   </div>
 </template>
@@ -94,6 +123,19 @@ const filterText = ref('')
 const selectedPid = ref(null)
 const creatingSnapshot = ref(false)
 const systemMemory = ref(0)
+const privilegeInfo = ref(null)
+
+const PROTECTED_PROCESSES = [
+  'csrss.exe', 'smss.exe', 'wininit.exe', 'winlogon.exe',
+  'services.exe', 'lsass.exe', 'lsm.exe', 'svchost.exe',
+  'system', 'registry', 'memcompress.exe', 'fontdrvhost.exe',
+  'dwm.exe', 'igfxcuiservice.exe', 'nvcontainer.exe'
+]
+
+const isProtectedProcess = (name) => {
+  if (!name) return false
+  return PROTECTED_PROCESSES.includes(name.toLowerCase())
+}
 
 const filteredProcesses = computed(() => {
   if (!filterText.value) return store.processes
@@ -133,6 +175,27 @@ const handleRowDoubleClick = (row) => {
 
 const handleCreateSnapshot = async () => {
   if (!selectedPid.value) return
+
+  const proc = store.processes.find(p => p.pid === selectedPid.value)
+  if (proc && isProtectedProcess(proc.name)) {
+    ElMessage.error(`进程 ${proc.name} 是受保护的系统进程，无法读取内存。请选择普通用户进程。`)
+    return
+  }
+
+  if (!privilegeInfo.value || !privilegeInfo.value.is_admin) {
+    const confirm = await ElMessageBox.confirm(
+      '检测到当前未以管理员身份运行，可能无法访问部分受保护进程。是否继续？建议以管理员身份重启程序后重试。',
+      '权限警告',
+      {
+        confirmButtonText: '继续尝试',
+        cancelButtonText: '取消',
+        type: 'warning',
+        distinguishCancelAndClose: true
+      }
+    ).catch(() => 'cancel')
+    if (confirm === 'cancel') return
+  }
+
   try {
     await ElMessageBox.confirm(
       `确定为进程 PID ${selectedPid.value} 创建内存快照？这可能需要一些时间。`,
@@ -154,7 +217,16 @@ const handleCreateSnapshot = async () => {
   }
 }
 
+const checkPrivilege = async () => {
+  try {
+    privilegeInfo.value = await store.checkPrivilege()
+  } catch (e) {
+    console.error('Failed to check privilege:', e)
+  }
+}
+
 onMounted(async () => {
+  await checkPrivilege()
   await store.refreshSnapshots()
   await loadProcesses()
 })

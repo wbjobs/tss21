@@ -1,8 +1,7 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use std::sync::Arc;
-use parking_lot::Mutex;
-use tauri::State;
+use tauri::{State, Window};
 use serde::{Deserialize, Serialize};
 
 pub mod models;
@@ -27,8 +26,13 @@ fn list_processes(state: State<'_, AppState>) -> Result<Vec<ProcessInfo>, String
 }
 
 #[tauri::command]
+fn check_privilege(pid: Option<u32>, state: State<'_, AppState>) -> PrivilegeCheckResult {
+    state.manager.check_privilege(pid)
+}
+
+#[tauri::command]
 fn create_snapshot(pid: u32, state: State<'_, AppState>) -> Result<SnapshotInfo, String> {
-    state.manager.create_snapshot(pid).map_err(|e| format!("创建快照失败: {}", e))
+    state.manager.create_snapshot(pid).map_err(|e| format!("{}", e))
 }
 
 #[tauri::command]
@@ -66,10 +70,18 @@ fn read_memory_region(
 fn scan_memory_pattern(
     snapshot_id: i64,
     pattern: String,
+    window: Window,
     state: State<'_, AppState>,
 ) -> Result<ScanResult, String> {
-    state.manager.scan_pattern(snapshot_id, &pattern)
-        .map_err(|e| format!("扫描失败: {}", e))
+    let window_arc = std::sync::Arc::new(window);
+    let result = state.manager.scan_pattern(
+        snapshot_id,
+        &pattern,
+        Some(move |progress: ScanProgress| {
+            let _ = window_arc.emit("scan-progress", &progress);
+        }),
+    );
+    result.map_err(|e| format!("扫描失败: {}", e))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -84,6 +96,7 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             list_processes,
+            check_privilege,
             create_snapshot,
             list_snapshots,
             get_snapshot,

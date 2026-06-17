@@ -6,7 +6,9 @@ use chrono::Utc;
 
 use crate::db::Database;
 use crate::win32;
-use crate::models::{SnapshotInfo, MemoryRegion, MemoryReadResult, RegionType};
+use crate::models::{SnapshotInfo, MemoryRegion, MemoryReadResult, RegionType, ScanProgress};
+
+pub type ProgressCallback = dyn Fn(ScanProgress) + Send + Sync;
 
 pub struct SnapshotManager {
     pub db: Database,
@@ -30,7 +32,7 @@ impl SnapshotManager {
         let now = Utc::now().timestamp_millis();
 
         let h = win32::open_process(pid)
-            .map_err(|e| anyhow!("打开进程失败: {}", e))?;
+            .map_err(|e| anyhow!(e))?;
 
         let process_info = win32::list_processes()?
             .into_iter()
@@ -55,12 +57,21 @@ impl SnapshotManager {
         let mut total_bytes: i64 = 0;
         let mut region_count: i64 = 0;
         let mut file_offset: i64 = 0;
+        let mut failed_regions = 0i64;
+        let mut skipped_no_access = 0i64;
 
         for region in &regions {
+            if !region.is_readable {
+                skipped_no_access += 1;
+                self.db.insert_region(region, None, 0, 0)?;
+                region_count += 1;
+                continue;
+            }
+
             let base_addr = u64::from_str_radix(&region.base_address, 16).unwrap_or(0);
             let rsize = region.region_size as usize;
-            let (stored_data_path, stored_offset, stored_length) = if region.state == "Commit" {
-                match win32::read_memory(h.0, base_addr, rsize.min(256 * 1024 * 1024)) {
+            let (stored_data_path, stored_offset, stored_length) = if region.state == "Commit" && region.is_readable {
+                match win32::try_read_memory_safe(h.0, base_addr, rsize.min(128 * 1024 * 1024)) {
                     Ok(data) if !data.is_empty() => {
                         data_file_handle.write_all(&data)?;
                         let len = data.len() as i64;
@@ -68,6 +79,10 @@ impl SnapshotManager {
                         file_offset += len;
                         total_bytes += len;
                         (Some(data_file.clone()), off, len)
+                    }
+                    Err(_) => {
+                        failed_regions += 1;
+                        (None, 0, 0)
                     }
                     _ => (None, 0, 0),
                 }
@@ -88,8 +103,38 @@ impl SnapshotManager {
 
         self.db.update_snapshot_stats(snapshot_id, total_bytes, region_count)?;
 
-        self.db.get_snapshot(snapshot_id)?
-            .ok_or_else(|| anyhow!("快照创建后无法读取"))
+        let snap = self.db.get_snapshot(snapshot_id)?
+            .ok_or_else(|| anyhow!("快照创建后无法读取"))?;
+
+        Ok(snap)
+    }
+
+    pub fn check_privilege(&self, pid: Option<u32>) -> crate::models::PrivilegeCheckResult {
+        let is_admin = win32::is_admin();
+        let (can_open, suggested) = match pid {
+            Some(pid) => {
+                let (ok, msg) = win32::probe_process_access(pid);
+                (ok, if !ok && !is_admin {
+                    "请以管理员身份运行此程序以获取完整访问权限".to_string()
+                } else if !ok {
+                    msg
+                } else {
+                    "权限充足".to_string()
+                })
+            }
+            None => {
+                (false, if !is_admin {
+                    "请以管理员身份运行以访问系统进程".to_string()
+                } else {
+                    "已以管理员权限运行".to_string()
+                })
+            }
+        };
+        crate::models::PrivilegeCheckResult {
+            is_admin,
+            can_open_process: can_open,
+            suggested_action: suggested,
+        }
     }
 
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
@@ -129,7 +174,7 @@ impl SnapshotManager {
         let region_base = u64::from_str_radix(&result.base_address, 16).unwrap_or(0);
 
         let offset_in_region = (address - region_base) as i64;
-        let data_path = dp.ok_or_else(|| anyhow!("该内存区域未存储快照数据"))?;
+        let data_path = dp.ok_or_else(|| anyhow!("该内存区域未存储快照数据（可能不可读）"))?;
         let full_path = self.data_dir.join(&data_path);
 
         if offset_in_region >= d_len {
@@ -164,11 +209,15 @@ impl SnapshotManager {
         })
     }
 
-    pub fn scan_pattern(
+    pub fn scan_pattern<F>(
         &self,
         snapshot_id: i64,
         pattern_str: &str,
-    ) -> Result<crate::models::ScanResult> {
+        progress_cb: Option<F>,
+    ) -> Result<crate::models::ScanResult>
+    where
+        F: Fn(ScanProgress),
+    {
         use std::time::Instant;
         let start = Instant::now();
 
@@ -178,11 +227,31 @@ impl SnapshotManager {
         }
 
         let regions = self.db.get_regions(snapshot_id)?;
+
+        let scannable_regions: Vec<_> = regions.iter()
+            .filter(|r| r.is_readable && r.has_data)
+            .collect();
+
+        let total_regions = scannable_regions.len();
         let mut matches = Vec::new();
         let mut regions_scanned = 0usize;
         let mut bytes_scanned: u64 = 0;
+        let mut regions_skipped_no_access = 0usize;
+        let mut regions_skipped_guard = 0usize;
 
-        for region in &regions {
+        for (idx, region) in regions.iter().enumerate() {
+            if !region.is_readable {
+                if region.protection.contains("GUARD") {
+                    regions_skipped_guard += 1;
+                } else {
+                    regions_skipped_no_access += 1;
+                }
+                continue;
+            }
+            if !region.has_data {
+                continue;
+            }
+
             let (_id, dp, d_off, d_len) = self.db.get_region_data_info(region.id)?;
             let data_path = match dp {
                 Some(p) => p,
@@ -192,33 +261,65 @@ impl SnapshotManager {
 
             let region_base = u64::from_str_radix(&region.base_address, 16).unwrap_or(0);
 
-            if let Ok(data) = read_region_data(&full_path, d_off, d_len) {
-                regions_scanned += 1;
-                bytes_scanned += data.len() as u64;
+            if let Some(ref cb) = progress_cb {
+                let progress = if total_regions > 0 {
+                    ((idx as f64 / total_regions as f64) * 100.0) as u32
+                } else { 0 };
+                cb(ScanProgress {
+                    current: idx,
+                    total: total_regions,
+                    percent: progress.min(99),
+                    current_region: region.module_name.clone().or(region.details.clone()).or_else(|| format!("0x{}", region.base_address)),
+                    bytes_scanned,
+                    matches_found: matches.len(),
+                });
+            }
 
-                for m in search_pattern(&data, &pattern) {
-                    let match_addr = region_base + m as u64;
-                    let start_ctx = m.saturating_sub(4);
-                    let end_ctx = (m + pattern.len() + 12).min(data.len());
-                    let ctx = &data[start_ctx..end_ctx];
-                    let ctx_hex = ctx.iter()
-                        .map(|b| format!("{:02X}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
+            match read_region_data(&full_path, d_off, d_len) {
+                Ok(data) if !data.is_empty() => {
+                    regions_scanned += 1;
+                    bytes_scanned += data.len() as u64;
 
-                    matches.push(crate::models::ScanMatch {
-                        address: format!("{:X}", match_addr),
-                        region_type: region.region_type.clone(),
-                        module_name: region.module_name.clone(),
-                        offset_in_region: format!("{:X}", m),
-                        context_hex: ctx_hex,
-                    });
+                    for m in search_pattern(&data, &pattern) {
+                        let match_addr = region_base + m as u64;
+                        let start_ctx = m.saturating_sub(4);
+                        let end_ctx = (m + pattern.len() + 12).min(data.len());
+                        let ctx = &data[start_ctx..end_ctx];
+                        let ctx_hex = ctx.iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
 
-                    if matches.len() >= 5000 {
-                        break;
+                        matches.push(crate::models::ScanMatch {
+                            address: format!("{:X}", match_addr),
+                            region_type: region.region_type.clone(),
+                            module_name: region.module_name.clone(),
+                            offset_in_region: format!("{:X}", m),
+                            context_hex: ctx_hex,
+                        });
+
+                        if matches.len() >= 5000 {
+                            break;
+                        }
                     }
                 }
+                _ => continue,
             }
+
+            if matches.len() >= 5000 {
+                break;
+            }
+        }
+
+        if let Some(ref cb) = progress_cb {
+            cb(ScanProgress {
+                current: total_regions,
+                total: total_regions,
+                percent: 100,
+                current_region: "扫描完成".to_string(),
+                bytes_scanned,
+                matches_found: matches.len(),
+            });
         }
 
         let total = matches.len();
@@ -228,6 +329,8 @@ impl SnapshotManager {
             regions_scanned,
             bytes_scanned,
             elapsed_ms: start.elapsed().as_millis(),
+            regions_skipped_no_access,
+            regions_skipped_guard,
         })
     }
 }

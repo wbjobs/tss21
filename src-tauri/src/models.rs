@@ -46,6 +46,8 @@ pub struct MemoryRegion {
     pub module_name: String,
     pub details: String,
     pub has_data: bool,
+    pub is_readable: bool,
+    pub is_writable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,4 +76,23 @@ pub struct ScanResult {
     pub regions_scanned: usize,
     pub bytes_scanned: u64,
     pub elapsed_ms: u128,
+    pub regions_skipped_no_access: usize,
+    pub regions_skipped_guard: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanProgress {
+    pub current: usize,
+    pub total: usize,
+    pub percent: u32,
+    pub current_region: String,
+    pub bytes_scanned: u64,
+    pub matches_found: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivilegeCheckResult {
+    pub is_admin: bool,
+    pub can_open_process: bool,
+    pub suggested_action: String,
 }

@@ -28,6 +28,21 @@ fn str_to_region_type(s: &str) -> RegionType {
     }
 }
 
+fn parse_readable_from_protection(prot: &str) -> bool {
+    if prot.contains("NOA") || prot.contains("GUARD") {
+        return false;
+    }
+    prot.contains("R--") || prot.contains("RW-") || prot.contains("R-X")
+        || prot.contains("RWX") || prot.contains("RWC") || prot.contains("RWXC")
+}
+
+fn parse_writable_from_protection(prot: &str) -> bool {
+    if prot.contains("NOA") || prot.contains("GUARD") {
+        return false;
+    }
+    prot.contains("RW-") || prot.contains("RWX") || prot.contains("RWC") || prot.contains("RWXC")
+}
+
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
 }
@@ -82,6 +97,8 @@ impl Database {
                 data_path TEXT,
                 data_offset INTEGER NOT NULL DEFAULT 0,
                 data_length INTEGER NOT NULL DEFAULT 0,
+                is_readable INTEGER NOT NULL DEFAULT 1,
+                is_writable INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
             );
 
@@ -89,6 +106,15 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_regions_address ON memory_regions(snapshot_id, base_address);
             "#
         )?;
+
+        let _ = conn.execute(
+            "ALTER TABLE memory_regions ADD COLUMN is_readable INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE memory_regions ADD COLUMN is_writable INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(())
     }
 
@@ -132,8 +158,9 @@ impl Database {
         conn.execute(
             r#"INSERT INTO memory_regions
                (snapshot_id, region_type, base_address, region_size, protection, state,
-                type_info, module_name, details, data_path, data_offset, data_length)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                type_info, module_name, details, data_path, data_offset, data_length,
+                is_readable, is_writable)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
             params![
                 region.snapshot_id,
                 region_type_to_str(&region.region_type),
@@ -147,6 +174,8 @@ impl Database {
                 data_path,
                 data_offset,
                 data_length,
+                if region.is_readable { 1 } else { 0 },
+                if region.is_writable { 1 } else { 0 },
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -220,23 +249,32 @@ impl Database {
         let mut stmt = conn.prepare(
             r#"SELECT r.id, r.snapshot_id, r.region_type, r.base_address, r.region_size,
                       r.protection, r.state, r.type_info, r.module_name, r.details,
-                      CASE WHEN r.data_length > 0 THEN 1 ELSE 0 END as has_data
+                      CASE WHEN r.data_length > 0 THEN 1 ELSE 0 END as has_data,
+                      COALESCE(r.is_readable, 1),
+                      COALESCE(r.is_writable, 0)
                FROM memory_regions r WHERE r.snapshot_id = ?1
                ORDER BY r.base_address ASC"#
         )?;
         let rows = stmt.query_map(params![snapshot_id], |row| {
+            let protection: String = row.get(5).unwrap_or_default();
+            let db_readable: i64 = row.get(11).unwrap_or(1);
+            let db_writable: i64 = row.get(12).unwrap_or(0);
+            let readable = db_readable > 0 || parse_readable_from_protection(&protection);
+            let writable = db_writable > 0 || parse_writable_from_protection(&protection);
             Ok(MemoryRegion {
                 id: row.get(0)?,
                 snapshot_id: row.get(1)?,
                 region_type: str_to_region_type(&row.get::<_, String>(2)?),
                 base_address: row.get(3)?,
                 region_size: row.get(4)?,
-                protection: row.get(5).unwrap_or_default(),
+                protection,
                 state: row.get(6).unwrap_or_default(),
                 type_info: row.get(7).unwrap_or_default(),
                 module_name: row.get(8).unwrap_or_default(),
                 details: row.get(9).unwrap_or_default(),
                 has_data: row.get::<_, i64>(10)? > 0,
+                is_readable: readable,
+                is_writable: writable,
             })
         })?;
         let mut result = Vec::new();
@@ -264,24 +302,33 @@ impl Database {
         let mut stmt = conn.prepare(
             r#"SELECT r.id, r.snapshot_id, r.region_type, r.base_address, r.region_size,
                       r.protection, r.state, r.type_info, r.module_name, r.details,
-                      CASE WHEN r.data_length > 0 THEN 1 ELSE 0 END as has_data
+                      CASE WHEN r.data_length > 0 THEN 1 ELSE 0 END as has_data,
+                      COALESCE(r.is_readable, 1),
+                      COALESCE(r.is_writable, 0)
                FROM memory_regions r
                WHERE r.snapshot_id = ?1
                ORDER BY r.base_address ASC"#
         )?;
         let rows = stmt.query_map(params![snapshot_id], |row| {
+            let protection: String = row.get(5).unwrap_or_default();
+            let db_readable: i64 = row.get(11).unwrap_or(1);
+            let db_writable: i64 = row.get(12).unwrap_or(0);
+            let readable = db_readable > 0 || parse_readable_from_protection(&protection);
+            let writable = db_writable > 0 || parse_writable_from_protection(&protection);
             Ok(MemoryRegion {
                 id: row.get(0)?,
                 snapshot_id: row.get(1)?,
                 region_type: str_to_region_type(&row.get::<_, String>(2)?),
                 base_address: row.get(3)?,
                 region_size: row.get(4)?,
-                protection: row.get(5).unwrap_or_default(),
+                protection,
                 state: row.get(6).unwrap_or_default(),
                 type_info: row.get(7).unwrap_or_default(),
                 module_name: row.get(8).unwrap_or_default(),
                 details: row.get(9).unwrap_or_default(),
                 has_data: row.get::<_, i64>(10)? > 0,
+                is_readable: readable,
+                is_writable: writable,
             })
         })?;
         for r in rows {

@@ -1,16 +1,15 @@
 use std::ptr;
 use std::mem;
-use winapi::shared::minwindef::{DWORD, HMODULE, LPVOID, BOOL, TRUE, FALSE};
-use winapi::shared::ntdef::{HANDLE, LPCSTR, LPCWSTR, PVOID, ULONG};
+use winapi::shared::minwindef::{DWORD, HMODULE, LPVOID, BOOL, TRUE, FALSE, LUID, PLUID, PBOOL};
+use winapi::shared::ntdef::{HANDLE, LPCSTR, LPCWSTR, PVOID, ULONG, NTSTATUS};
 use winapi::um::tlhelp32::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
-    Module32FirstW, Module32NextW,
     Thread32First, Thread32Next,
-    PROCESSENTRY32W, MODULEENTRY32W, THREADENTRY32,
-    TH32CS_SNAPPROCESS, TH32CS_SNAPMODULE, TH32CS_SNAPTHREAD, TH32CS_SNAPMODULE32,
+    PROCESSENTRY32W, THREADENTRY32,
+    TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD,
 };
 use winapi::um::winbase::{
-    OpenProcess, QueryDosDeviceW,
+    OpenProcess,
     MEMORY_BASIC_INFORMATION,
     MEM_COMMIT, MEM_FREE, MEM_RESERVE,
     PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
@@ -22,11 +21,21 @@ use winapi::um::memoryapi::{VirtualQueryEx, ReadProcessMemory};
 use winapi::um::processthreadsapi::GetCurrentProcessId;
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::psapi::{K32EnumProcessModulesEx, K32GetModuleBaseNameW, K32GetModuleFileNameExW, LIST_MODULES_ALL};
-use winapi::um::winnt::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, MEMORY_INFORMATION_CLASS};
+use winapi::um::winnt::{
+    PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_QUERY_LIMITED_INFORMATION,
+    TOKEN_QUERY, TOKEN_ADJUST_PRIVILEGES, SE_PRIVILEGE_ENABLED,
+    ANYSIZE_ARRAY, PRIVILEGE_SET,
+};
+use winapi::um::securitybaseapi::{AdjustTokenPrivileges, PrivilegeCheck, LookupPrivilegeValueW};
+use winapi::um::processenv::GetStdHandle;
+use winapi::um::errhandlingapi::GetLastError;
+use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
 
 use crate::models::{ProcessInfo, MemoryRegion, RegionType};
 
-const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_PARTIAL_COPY: u32 = 299;
 
 pub struct ProcessHandle(pub HANDLE);
 
@@ -53,6 +62,75 @@ unsafe fn wchar_to_string(ptr: *const u16) -> String {
     String::from_utf16_lossy(slice)
 }
 
+fn str_to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn get_last_error_msg() -> String {
+    let err = unsafe { GetLastError() };
+    match err {
+        ERROR_ACCESS_DENIED => format!("拒绝访问 (ERROR_ACCESS_DENIED, code 5)"),
+        ERROR_INVALID_PARAMETER => format!("无效参数 (ERROR_INVALID_PARAMETER, code 87)"),
+        ERROR_PARTIAL_COPY => format!("部分复制成功 (ERROR_PARTIAL_COPY, code 299)"),
+        other => format!("系统错误码: {}", other),
+    }
+}
+
+pub fn is_admin() -> bool {
+    let mut h_token: HANDLE = ptr::null_mut();
+    let ok = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+            &mut h_token
+        )
+    };
+    if ok == FALSE as BOOL {
+        return false;
+    }
+    let _guard = ProcessHandle(h_token);
+
+    let debug_name = str_to_wide("SeDebugPrivilege");
+    let mut luid: LUID = unsafe { mem::zeroed() };
+    let ok = unsafe {
+        LookupPrivilegeValueW(
+            ptr::null(),
+            debug_name.as_ptr(),
+            &mut luid
+        )
+    };
+    if ok == FALSE as BOOL {
+        return false;
+    }
+
+    let mut privs: PRIVILEGE_SET = unsafe { mem::zeroed() };
+    privs.PrivilegeCount = 1;
+    privs.Control = PRIVILEGE_SET as u32;
+    privs.Privilege[0].Luid = luid;
+    privs.Privilege[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    let mut result: BOOL = FALSE as BOOL;
+    let ok = unsafe {
+        PrivilegeCheck(
+            h_token,
+            &mut privs,
+            &mut result as PBOOL
+        )
+    };
+    ok != FALSE as BOOL && result != FALSE as BOOL
+}
+
+pub fn is_protected_system_process(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    matches!(
+        lower.as_str(),
+        "csrss.exe" | "smss.exe" | "wininit.exe" | "winlogon.exe"
+        | "services.exe" | "lsass.exe" | "lsm.exe" | "svchost.exe"
+        | "system" | "registry" | "memcompress.exe" | "fontdrvhost.exe"
+        | "dwm.exe" | "igfxCUIService.exe" | "nvcontainer.exe"
+    )
+}
+
 fn protection_to_string(prot: DWORD) -> String {
     let mut parts = Vec::new();
     let base = prot & 0xFF;
@@ -71,6 +149,28 @@ fn protection_to_string(prot: DWORD) -> String {
     if prot & PAGE_NOCACHE != 0 { parts.push("NC"); }
     if prot & PAGE_WRITECOMBINE != 0 { parts.push("WC"); }
     parts.join("|")
+}
+
+fn is_readable(prot: DWORD) -> bool {
+    if prot & PAGE_GUARD != 0 { return false; }
+    if prot & PAGE_NOACCESS != 0 { return false; }
+    let base = prot & 0xFF;
+    matches!(
+        base,
+        PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
+    )
+}
+
+fn is_writable(prot: DWORD) -> bool {
+    if prot & PAGE_GUARD != 0 { return false; }
+    if prot & PAGE_NOACCESS != 0 { return false; }
+    let base = prot & 0xFF;
+    matches!(
+        base,
+        PAGE_READWRITE | PAGE_EXECUTE_READWRITE
+        | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
+    )
 }
 
 fn state_to_string(state: DWORD) -> String {
@@ -96,17 +196,71 @@ fn base_address_string(addr: u64) -> String {
 }
 
 pub fn open_process(pid: u32) -> Result<ProcessHandle, String> {
+    let process_info_opt = list_processes().ok()
+        .and_then(|list| list.into_iter().find(|p| p.pid == pid));
+
+    if let Some(info) = &process_info_opt {
+        if is_protected_system_process(&info.name) {
+            return Err(format!(
+                "进程 {} 是受保护的系统进程，无法读取。\n\
+                 该进程为 Windows 关键系统进程，即使以管理员身份也无法直接读取内存。\n\
+                 建议选择普通用户进程（如 notepad.exe、chrome.exe、游戏进程等）",
+                info.name
+            ));
+        }
+    }
+
+    let desired_access = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION;
+    let handle = unsafe {
+        OpenProcess(desired_access, FALSE as BOOL, pid)
+    };
+
+    if handle.is_null() {
+        let err = unsafe { GetLastError() };
+        let admin = is_admin();
+        let suggestion = if err == ERROR_ACCESS_DENIED {
+            if admin {
+                "当前已为管理员权限，但进程可能受反作弊/DRM保护，或属于系统关键进程"
+            } else {
+                "请尝试以【管理员身份运行】此程序，然后重试"
+            }
+        } else {
+            "请检查进程是否仍在运行"
+        };
+
+        let name = process_info_opt.as_ref().map(|p| p.name.as_str()).unwrap_or("未知进程");
+        Err(format!(
+            "无法打开进程 PID={} ({}): {}\n\n建议: {}",
+            pid, name, get_last_error_msg(), suggestion
+        ))
+    } else {
+        Ok(ProcessHandle(handle))
+    }
+}
+
+pub fn probe_process_access(pid: u32) -> (bool, String) {
     let handle = unsafe {
         OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
             FALSE as BOOL,
             pid
         )
     };
     if handle.is_null() {
-        Err(format!("无法打开进程 PID={}", pid))
+        let err = unsafe { GetLastError() };
+        let msg = if err == ERROR_ACCESS_DENIED {
+            if is_admin() {
+                "拒绝访问 - 进程受保护，即使管理员也无法读取".to_string()
+            } else {
+                "拒绝访问 - 请以管理员身份运行此程序".to_string()
+            }
+        } else {
+            format!("无法访问: {}", get_last_error_msg())
+        };
+        (false, msg)
     } else {
-        Ok(ProcessHandle(handle))
+        unsafe { CloseHandle(handle); }
+        (true, "可以访问".to_string())
     }
 }
 
@@ -115,7 +269,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
         CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     };
     if h_snapshot.is_null() || h_snapshot as isize == -1 {
-        return Err("创建进程快照失败".into());
+        return Err(format!("创建进程快照失败: {}", get_last_error_msg()));
     }
     let _guard = ProcessHandle(h_snapshot);
 
@@ -133,13 +287,13 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
         let name = unsafe { wchar_to_string(pe32.szExeFile.as_ptr()) };
         let current_pid = unsafe { GetCurrentProcessId() };
         let (path, memory_usage_mb, thread_count) = if pid != current_pid {
-            match open_process(pid) {
-                Ok(h) => (
+            match open_process_silent(pid) {
+                Some(h) => (
                     get_process_path(h.0, pid).unwrap_or_default(),
                     get_process_memory_usage(h.0).unwrap_or(0.0),
                     get_process_thread_count(pid).unwrap_or(pe32.cntThreads)
                 ),
-                Err(_) => (String::new(), 0.0, pe32.cntThreads),
+                None => (String::new(), 0.0, pe32.cntThreads),
             }
         } else {
             (String::new(), 0.0, pe32.cntThreads)
@@ -160,6 +314,21 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
         }
     }
     Ok(processes)
+}
+
+fn open_process_silent(pid: u32) -> Option<ProcessHandle> {
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE as BOOL,
+            pid
+        )
+    };
+    if handle.is_null() {
+        None
+    } else {
+        Some(ProcessHandle(handle))
+    }
 }
 
 fn get_process_path(h_process: HANDLE, _pid: u32) -> Result<String, String> {
@@ -201,81 +370,6 @@ fn get_process_thread_count(target_pid: u32) -> Result<u32, String> {
         res = unsafe { Thread32Next(h_snapshot, &mut te32) };
     }
     Ok(count)
-}
-
-#[derive(Clone)]
-struct RawRegion {
-    pub base_address: u64,
-    pub region_size: i64,
-    pub protection: String,
-    pub state: String,
-    pub type_info: String,
-}
-
-fn get_memory_regions_internal(h_process: HANDLE, snapshot_id: i64, with_data: bool) -> Result<Vec<MemoryRegion>, String> {
-    let modules = get_process_modules(h_process).unwrap_or_default();
-
-    let mut regions: Vec<MemoryRegion> = Vec::new();
-    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
-    let mut address: u64 = 0;
-    let mbi_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
-
-    loop {
-        let size = unsafe {
-            VirtualQueryEx(
-                h_process,
-                address as *const _,
-                &mut mbi,
-                mbi_size
-            )
-        };
-        if size != mbi_size {
-            break;
-        }
-
-        let base = mbi.BaseAddress as u64;
-        let rsize = mbi.RegionSize as i64;
-
-        if mbi.State == MEM_FREE {
-            address = base + rsize as u64;
-            continue;
-        }
-
-        let region_type = classify_region(base, rsize, &mbi, &modules);
-        let module_name = find_module_name(base, &modules);
-        let details = if module_name.is_empty() {
-            match region_type {
-                RegionType::Heap => format!("堆区域"),
-                RegionType::Stack => format!("线程栈"),
-                RegionType::Private => format!("私有提交区域"),
-                RegionType::Mapped => format!("映射文件"),
-                _ => String::new(),
-            }
-        } else {
-            String::new()
-        };
-
-        regions.push(MemoryRegion {
-            id: 0,
-            snapshot_id,
-            region_type,
-            base_address: base_address_string(base),
-            region_size: rsize,
-            protection: protection_to_string(mbi.Protect),
-            state: state_to_string(mbi.State),
-            type_info: type_info_to_string(mbi.Type),
-            module_name,
-            details,
-            has_data: with_data && mbi.State == MEM_COMMIT,
-        });
-
-        address = base + rsize as u64;
-        if address == 0 {
-            break;
-        }
-    }
-
-    Ok(regions)
 }
 
 struct ModuleInfo {
@@ -370,6 +464,82 @@ fn find_module_name(base: u64, modules: &[ModuleInfo]) -> String {
     String::new()
 }
 
+fn get_memory_regions_internal(h_process: HANDLE, snapshot_id: i64, with_data: bool) -> Result<Vec<MemoryRegion>, String> {
+    let modules = get_process_modules(h_process).unwrap_or_default();
+
+    let mut regions: Vec<MemoryRegion> = Vec::new();
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
+    let mut address: u64 = 0;
+    let mbi_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
+
+    loop {
+        let size = unsafe {
+            VirtualQueryEx(
+                h_process,
+                address as *const _,
+                &mut mbi,
+                mbi_size
+            )
+        };
+        if size != mbi_size {
+            break;
+        }
+
+        let base = mbi.BaseAddress as u64;
+        let rsize = mbi.RegionSize as i64;
+
+        if mbi.State == MEM_FREE {
+            address = base + rsize as u64;
+            continue;
+        }
+
+        let region_type = classify_region(base, rsize, &mbi, &modules);
+        let module_name = find_module_name(base, &modules);
+        let details = if module_name.is_empty() {
+            match region_type {
+                RegionType::Heap => format!("堆区域"),
+                RegionType::Stack => format!("线程栈"),
+                RegionType::Private => format!("私有提交区域"),
+                RegionType::Mapped => format!("映射文件"),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        let readable = is_readable(mbi.Protect);
+        let writable = is_writable(mbi.Protect);
+        let should_store_data = with_data
+            && mbi.State == MEM_COMMIT
+            && readable
+            && !module_name.is_empty()
+            && rsize <= 256 * 1024 * 1024;
+
+        regions.push(MemoryRegion {
+            id: 0,
+            snapshot_id,
+            region_type,
+            base_address: base_address_string(base),
+            region_size: rsize,
+            protection: protection_to_string(mbi.Protect),
+            state: state_to_string(mbi.State),
+            type_info: type_info_to_string(mbi.Type),
+            module_name,
+            details,
+            has_data: should_store_data,
+            is_readable: readable,
+            is_writable: writable,
+        });
+
+        address = base + rsize as u64;
+        if address == 0 {
+            break;
+        }
+    }
+
+    Ok(regions)
+}
+
 pub fn get_memory_regions(h_process: HANDLE, snapshot_id: i64) -> Result<Vec<MemoryRegion>, String> {
     get_memory_regions_internal(h_process, snapshot_id, true)
 }
@@ -389,10 +559,52 @@ pub fn read_memory(h_process: HANDLE, address: u64, length: usize) -> Result<Vec
             &mut bytes_read as *mut usize as *mut _
         )
     };
-    if ok == FALSE as BOOL || bytes_read == 0 {
-        Err(format!("读取内存失败 @ 0x{:X} ({} bytes)", address, length))
+    let err = unsafe { GetLastError() };
+    if ok == FALSE as BOOL {
+        if err == ERROR_PARTIAL_COPY && bytes_read > 0 {
+            buf.truncate(bytes_read);
+            return Ok(buf);
+        }
+        Err(format!("读取内存失败 @ 0x{:X}: {}", address, get_last_error_msg()))
+    } else if bytes_read == 0 {
+        Err(format!("读取内存失败 @ 0x{:X}: 读取字节数为0", address))
     } else {
         buf.truncate(bytes_read);
         Ok(buf)
+    }
+}
+
+pub fn try_read_memory_safe(h_process: HANDLE, address: u64, length: usize) -> Result<Vec<u8>, String> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    let max_chunk = 4096;
+    let mut result = Vec::with_capacity(length);
+    let mut offset = 0usize;
+
+    while offset < length {
+        let chunk_size = (length - offset).min(max_chunk);
+        match read_memory(h_process, address + offset as u64, chunk_size) {
+            Ok(mut chunk) => {
+                result.append(&mut chunk);
+                if chunk.len() < chunk_size {
+                    break;
+                }
+                offset += chunk_size;
+            }
+            Err(e) => {
+                if result.is_empty() {
+                    return Err(e);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    if result.is_empty() {
+        Err(format!("读取内存失败 @ 0x{:X}", address))
+    } else {
+        Ok(result)
     }
 }

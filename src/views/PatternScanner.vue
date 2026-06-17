@@ -6,6 +6,15 @@
       style="margin-bottom: 16px;"
     />
 
+    <el-alert
+      v-if="privilegeInfo && !privilegeInfo.is_admin"
+      type="warning"
+      show-icon
+      :title="'权限提示：当前未以管理员身份运行，部分受保护进程可能无法访问'"
+      :description="privilegeInfo.suggested_action"
+      style="margin-bottom: 16px;"
+    />
+
     <el-card class="scan-card">
       <template #header>
         <div class="card-header">
@@ -23,6 +32,7 @@
               size="large"
               clearable
               style="flex: 1;"
+              :disabled="scanning"
             >
               <template #prefix>
                 <el-icon color="#e94560"><Key /></el-icon>
@@ -31,12 +41,12 @@
             <el-button
               type="primary"
               size="large"
-              :icon="VideoPlay"
-              :loading="store.loading"
+              :icon="scanning ? VideoPause : VideoPlay"
+              :loading="scanning"
               @click="doScan"
               style="margin-left: 12px;"
             >
-              开始扫描
+              {{ scanning ? '扫描中...' : '开始扫描' }}
             </el-button>
           </div>
           <div class="pattern-tips">
@@ -56,27 +66,55 @@
             effect="light"
             class="preset-tag"
             @click="pattern = p.pattern"
+            :disabled="scanning"
             style="cursor: pointer;"
           >
             {{ p.name }}
           </el-tag>
         </div>
 
+        <div v-if="scanning && scanProgress" class="progress-section">
+          <div class="progress-header">
+            <span class="progress-label">
+              扫描进度: {{ scanProgress.percent }}% ({{ scanProgress.current }}/{{ scanProgress.total }} 个区域)
+            </span>
+            <span class="progress-info">
+              已扫描: {{ (scanProgress.bytes_scanned / 1048576).toFixed(2) }} MB | 匹配: {{ scanProgress.matches_found }} 处
+            </span>
+          </div>
+          <el-progress
+            :percentage="scanProgress.percent"
+            :status="scanning ? 'success' : undefined"
+            :stroke-width="14"
+            :color="progressColor"
+          />
+          <div v-if="scanProgress.current_region" class="current-region">
+            <el-icon color="#a78bfa"><Loading /></el-icon>
+            正在扫描: {{ scanProgress.current_region }}
+          </div>
+        </div>
+
         <el-divider />
 
         <div v-if="scanStats.total_matches !== undefined" class="scan-stats">
           <el-row :gutter="24">
-            <el-col :span="6">
+            <el-col :span="5">
               <el-statistic title="匹配次数" :value="scanStats.total_matches" value-style="color: #e94560;" />
             </el-col>
-            <el-col :span="6">
+            <el-col :span="4">
               <el-statistic title="扫描区域" :value="scanStats.regions_scanned || 0" />
             </el-col>
-            <el-col :span="6">
+            <el-col :span="5">
               <el-statistic title="扫描大小 (MB)" :value="scanStats.mb_scanned || 0" :precision="2" />
             </el-col>
-            <el-col :span="6">
+            <el-col :span="4">
               <el-statistic title="耗时 (ms)" :value="scanStats.elapsed_ms || 0" />
+            </el-col>
+            <el-col :span="3">
+              <el-statistic title="跳过NOA" :value="scanStats.regions_skipped_no_access || 0" value-style="color: #f59e0b;" />
+            </el-col>
+            <el-col :span="3">
+              <el-statistic title="跳过GUARD" :value="scanStats.regions_skipped_guard || 0" value-style="color: #6366f1;" />
             </el-col>
           </el-row>
         </div>
@@ -95,7 +133,7 @@
         </div>
       </template>
 
-      <el-empty v-if="results.length === 0 && !store.loading" description="暂无匹配结果，请输入特征码后扫描" />
+      <el-empty v-if="results.length === 0 && !scanning" description="暂无匹配结果，请输入特征码后扫描" />
 
       <el-table
         v-else
@@ -103,7 +141,7 @@
         height="480"
         highlight-current-row
         style="width: 100%;"
-        v-loading="store.loading"
+        v-loading="scanning"
       >
         <el-table-column type="index" label="#" width="70" />
         <el-table-column label="地址" width="200">
@@ -149,13 +187,14 @@
 </template>
 
 <script setup>
-import { ref, onMounted, markRaw } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
-  Search, Key, VideoPlay, Download, List
+  Search, Key, VideoPlay, VideoPause, Download, List, Loading
 } from '@element-plus/icons-vue'
 import { useProcessStore } from '../stores/process'
+import { listen } from '@tauri-apps/api/event'
 
 const route = useRoute()
 const router = useRouter()
@@ -164,7 +203,18 @@ const snapshotId = Number(route.params.snapshotId)
 
 const pattern = ref('4D 5A ?? ?? 00 00 00 00')
 const results = ref([])
+const scanning = ref(false)
+const scanProgress = ref(null)
 const scanStats = ref({})
+const privilegeInfo = ref(null)
+let unlistenFn = null
+
+const progressColor = computed(() => {
+  if (!scanProgress.value) return '#409eff'
+  if (scanProgress.value.percent >= 100) return '#67c23a'
+  if (scanProgress.value.percent >= 50) return '#e6a23c'
+  return '#409eff'
+})
 
 const presetPatterns = [
   { name: 'MZ Header (PE文件头)', pattern: '4D 5A ?? ?? 00 00 00 00' },
@@ -190,20 +240,33 @@ const doScan = async () => {
     ElMessage.warning('请输入特征码')
     return
   }
+  if (scanning.value) return
+
   results.value = []
-  const res = await store.scanPattern(snapshotId, pattern.value.trim())
-  if (res && res.matches) {
-    results.value = res.matches
-    scanStats.value = {
-      total_matches: res.total_matches || res.matches.length,
-      regions_scanned: res.regions_scanned,
-      mb_scanned: res.bytes_scanned ? res.bytes_scanned / 1048576 : 0,
-      elapsed_ms: res.elapsed_ms
+  scanProgress.value = null
+  scanning.value = true
+
+  try {
+    const res = await store.scanPattern(snapshotId, pattern.value.trim())
+    if (res && res.matches) {
+      results.value = res.matches
+      scanStats.value = {
+        total_matches: res.total_matches || res.matches.length,
+        regions_scanned: res.regions_scanned,
+        mb_scanned: res.bytes_scanned ? res.bytes_scanned / 1048576 : 0,
+        elapsed_ms: res.elapsed_ms,
+        regions_skipped_no_access: res.regions_skipped_no_access || 0,
+        regions_skipped_guard: res.regions_skipped_guard || 0,
+      }
+      ElMessage.success(`扫描完成，找到 ${results.value.length} 个匹配`)
+    } else {
+      results.value = []
+      ElMessage.info('未找到匹配结果')
     }
-    ElMessage.success(`扫描完成，找到 ${results.value.length} 个匹配`)
-  } else {
-    results.value = []
-    ElMessage.info('未找到匹配结果')
+  } catch (e) {
+    ElMessage.error('扫描失败: ' + e)
+  } finally {
+    scanning.value = false
   }
 }
 
@@ -237,9 +300,29 @@ const exportResults = () => {
   ElMessage.success('结果已导出')
 }
 
+const checkPrivilege = async () => {
+  try {
+    const res = await store.checkPrivilege(snapshotId)
+    privilegeInfo.value = res
+  } catch (e) {
+    console.error('Failed to check privilege:', e)
+  }
+}
+
 onMounted(async () => {
   if (!store.currentSnapshot || store.currentSnapshot.id !== snapshotId) {
     await store.loadSnapshot(snapshotId)
+  }
+  await checkPrivilege()
+
+  unlistenFn = await listen('scan-progress', (event) => {
+    scanProgress.value = event.payload
+  })
+})
+
+onBeforeUnmount(() => {
+  if (unlistenFn) {
+    unlistenFn()
   }
 })
 </script>
@@ -272,6 +355,40 @@ onMounted(async () => {
 
   .preset-section { margin-top: 16px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
   .preset-tag { margin-right: 0 !important; }
+
+  .progress-section {
+    margin-top: 16px;
+    padding: 16px;
+    background: #0f1a33;
+    border-radius: 8px;
+    border: 1px solid #1a2a4a;
+  }
+
+  .progress-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    font-size: 13px;
+  }
+
+  .progress-label {
+    color: #4ade80;
+    font-weight: 600;
+  }
+
+  .progress-info {
+    color: #8b9bb4;
+  }
+
+  .current-region {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #a78bfa;
+    font-family: Consolas, monospace;
+  }
 
   .scan-stats { padding: 8px 4px; }
 
