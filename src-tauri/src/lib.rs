@@ -84,6 +84,49 @@ fn scan_memory_pattern(
     result.map_err(|e| format!("扫描失败: {}", e))
 }
 
+#[tauri::command]
+fn compare_snapshots(
+    snapshot_a_id: i64,
+    snapshot_b_id: i64,
+    state: State<'_, AppState>,
+) -> Result<DiffResult, String> {
+    state.manager.compare_snapshots(snapshot_a_id, snapshot_b_id)
+        .map_err(|e| format!("对比快照失败: {}", e))
+}
+
+#[tauri::command]
+fn start_monitor(
+    pid: u32,
+    interval_ms: Option<u64>,
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<MonitorStatus, String> {
+    let window_arc = std::sync::Arc::new(window);
+    let interval = interval_ms.unwrap_or(1000);
+    state.manager.start_monitor(
+        pid,
+        interval,
+        Some(move |evt: MonitorCycleEvent| {
+            let _ = window_arc.emit("monitor-cycle", &evt);
+        }),
+    ).map_err(|e| format!("启动监控失败: {}", e))
+}
+
+#[tauri::command]
+fn stop_monitor(state: State<'_, AppState>) -> MonitorStatus {
+    state.manager.stop_monitor()
+}
+
+#[tauri::command]
+fn get_monitor_status(state: State<'_, AppState>) -> MonitorStatus {
+    state.manager.get_monitor_status()
+}
+
+#[tauri::command]
+fn get_monitor_logs(limit: Option<usize>, state: State<'_, AppState>) -> Vec<MonitorLogEntry> {
+    state.manager.get_monitor_logs(limit)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let manager = SnapshotManager::new()
@@ -104,6 +147,11 @@ pub fn run() {
             get_memory_regions,
             read_memory_region,
             scan_memory_pattern,
+            compare_snapshots,
+            start_monitor,
+            stop_monitor,
+            get_monitor_status,
+            get_monitor_logs,
         ])
         .run(tauri::generate_context!())
         .expect("启动应用失败");

@@ -44,17 +44,32 @@ fn parse_writable_from_protection(prot: &str) -> bool {
 }
 
 pub struct Database {
+    pub db_path: PathBuf,
     conn: Arc<Mutex<Connection>>,
 }
 
 impl Database {
     pub fn new() -> Result<Self> {
         let db_path = Self::db_path()?;
-        std::fs::create_dir_all(db_path.parent().unwrap())?;
+        Self::open(&db_path)
+    }
+
+    pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let db_path = path.as_ref().to_path_buf();
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(&db_path)?;
-        let db = Self { conn: Arc::new(Mutex::new(conn)) };
+        let db = Self { conn: Arc::new(Mutex::new(conn)), db_path };
         db.init_schema()?;
         Ok(db)
+    }
+
+    pub fn dummy() -> Self {
+        Self {
+            db_path: PathBuf::new(),
+            conn: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+        }
     }
 
     fn db_path() -> Result<PathBuf> {

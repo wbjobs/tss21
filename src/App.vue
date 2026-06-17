@@ -23,6 +23,14 @@
           <el-icon><FolderOpened /></el-icon>
           <span>快照管理</span>
         </el-menu-item>
+        <el-menu-item index="compare">
+          <el-icon><CopyDocument /></el-icon>
+          <span>快照对比</span>
+        </el-menu-item>
+        <el-menu-item index="monitor">
+          <el-icon><VideoPlay /></el-icon>
+          <span>内存监控</span>
+        </el-menu-item>
       </el-menu>
     </el-header>
 
@@ -36,6 +44,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useProcessStore } from './stores/process'
+import { Cpu, List, FolderOpened, CopyDocument, VideoPlay } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()

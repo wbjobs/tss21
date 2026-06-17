@@ -106,6 +106,54 @@ export const useProcessStore = defineStore('process', {
         console.error('Failed to check privilege:', e)
         return null
       }
+    },
+
+    async compareSnapshots(snapshotAId, snapshotBId) {
+      this.loading = true
+      try {
+        return await invoke('compare_snapshots', { snapshotAId, snapshotBId })
+      } catch (e) {
+        console.error('Failed to compare snapshots:', e)
+        throw e
+      } finally {
+        this.loading = false
+      }
+    },
+
+    async startMonitor(pid, intervalMs) {
+      try {
+        return await invoke('start_monitor', { pid, intervalMs })
+      } catch (e) {
+        console.error('Failed to start monitor:', e)
+        throw e
+      }
+    },
+
+    async stopMonitor() {
+      try {
+        return await invoke('stop_monitor')
+      } catch (e) {
+        console.error('Failed to stop monitor:', e)
+        throw e
+      }
+    },
+
+    async getMonitorStatus() {
+      try {
+        return await invoke('get_monitor_status')
+      } catch (e) {
+        console.error('Failed to get monitor status:', e)
+        return null
+      }
+    },
+
+    async getMonitorLogs(limit) {
+      try {
+        return await invoke('get_monitor_logs', { limit })
+      } catch (e) {
+        console.error('Failed to get monitor logs:', e)
+        return []
+      }
     }
   }
 })

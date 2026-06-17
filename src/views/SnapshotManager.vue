@@ -21,6 +21,21 @@
         模式扫描
       </el-button>
       <el-button
+        type="info"
+        :icon="CopyDocument"
+        @click="goCompare"
+      >
+        快照对比
+      </el-button>
+      <el-button
+        type="success"
+        plain
+        :icon="VideoPlay"
+        @click="goMonitor"
+      >
+        内存监控
+      </el-button>
+      <el-button
         type="danger"
         :icon="Delete"
         :disabled="!selectedId"
@@ -84,7 +99,7 @@
 import { ref, onMounted, markRaw } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, View, Search, Delete } from '@element-plus/icons-vue'
+import { Refresh, View, Search, Delete, CopyDocument, VideoPlay } from '@element-plus/icons-vue'
 import { useProcessStore } from '../stores/process'
 
 const router = useRouter()
@@ -103,6 +118,8 @@ const handleRowChange = (row) => {
 
 const viewMemory = (id) => router.push({ name: 'memory', params: { snapshotId: id } })
 const viewScan = (id) => router.push({ name: 'scan', params: { snapshotId: id } })
+const goCompare = () => router.push({ name: 'compare' })
+const goMonitor = () => router.push({ name: 'monitor' })
 
 const openMemoryViewer = () => selectedId.value && viewMemory(selectedId.value)
 const openScanner = () => selectedId.value && viewScan(selectedId.value)

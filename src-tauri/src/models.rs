@@ -96,3 +96,81 @@ pub struct PrivilegeCheckResult {
     pub can_open_process: bool,
     pub suggested_action: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffChangeType {
+    Modified,
+    Added,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffByte {
+    pub offset_in_region: u64,
+    pub absolute_address: String,
+    pub old_value: Option<u8>,
+    pub new_value: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffRegion {
+    pub base_address: String,
+    pub region_size: u64,
+    pub region_type: RegionType,
+    pub module_name: String,
+    pub change_type: DiffChangeType,
+    pub changed_bytes: Vec<DiffByte>,
+    pub change_count: usize,
+    pub change_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffResult {
+    pub snapshot_a_id: i64,
+    pub snapshot_b_id: i64,
+    pub process_name: String,
+    pub elapsed_ms: u128,
+    pub regions_compared: usize,
+    pub regions_modified: usize,
+    pub regions_added: usize,
+    pub regions_removed: usize,
+    pub total_changed_bytes: usize,
+    pub diff_regions: Vec<DiffRegion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorLogEntry {
+    pub timestamp: i64,
+    pub cycle_index: usize,
+    pub base_address: String,
+    pub region_type: RegionType,
+    pub module_name: String,
+    pub change_type: DiffChangeType,
+    pub offset_in_region: u64,
+    pub absolute_address: String,
+    pub old_value: Option<u8>,
+    pub new_value: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorStatus {
+    pub is_running: bool,
+    pub pid: Option<u32>,
+    pub process_name: Option<String>,
+    pub started_at: Option<i64>,
+    pub current_cycle: usize,
+    pub interval_ms: u64,
+    pub total_changes: usize,
+    pub log_entry_count: usize,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorCycleEvent {
+    pub cycle_index: usize,
+    pub timestamp: i64,
+    pub duration_ms: u64,
+    pub changes_found: usize,
+    pub total_changes_so_far: usize,
+}
